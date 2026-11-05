@@ -388,6 +388,9 @@ class AgentMiddleware(Generic[StateT, ContextT, ResponseT]):
     Subclass this and implement any of the defined methods to customize agent behavior
     between steps in the main agent loop.
 
+    To keep an internal chat model's tokens out of the agent's `messages` stream,
+    pass `config={"tags": ["nostream"]}` to that model's `invoke` or `ainvoke` call.
+
     Type Parameters:
         StateT: The type of the agent state. Defaults to `AgentState[Any]`.
         ContextT: The type of the runtime context. Defaults to `None`.

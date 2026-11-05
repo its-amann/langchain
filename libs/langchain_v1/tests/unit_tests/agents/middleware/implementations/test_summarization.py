@@ -1,6 +1,7 @@
+import asyncio
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     AnyMessage,
     BaseMessage,
     HumanMessage,
@@ -27,6 +29,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.constants import TAG_NOSTREAM
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from pydantic import Field
@@ -2471,6 +2474,7 @@ class TestSummarizationStreamingEndToEnd:
             texts.append(text)
 
         assert "Summary of prior turns." not in texts
+        assert "Final answer." in texts
 
 
 def test_summary_call_stays_off_the_messages_stream() -> None:
@@ -2493,6 +2497,60 @@ def test_summary_call_stays_off_the_messages_stream() -> None:
 
     assert any("SUMMARY-TEXT" in part.text for part in parts if isinstance(part, HumanMessage))
     assert "".join(part.text for part in parts if isinstance(part, AIMessage)) == "Final answer."
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+async def test_nested_summarizer_tokens_stay_off_the_messages_stream(
+    mode: Literal["sync", "async"],
+) -> None:
+    summary_model = GenericFakeChatModel(messages=iter([AIMessage(content="Nested summary.")]))
+
+    def summarize(state: MessagesState) -> dict[str, list[AIMessage]]:
+        return {"messages": [summary_model.invoke(state["messages"])]}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("summarize", summarize)
+    graph.add_edge(START, "summarize")
+    graph.add_edge("summarize", END)
+    summarizer = (
+        RunnableLambda(lambda messages: {"messages": messages})
+        | graph.compile()
+        | RunnableLambda(lambda state: state["messages"][-1].text)
+    )
+    agent = create_agent(
+        model=GenericFakeChatModel(messages=iter([AIMessage(content="Final answer.")])),
+        middleware=[
+            SummarizationMiddleware(
+                model=_AlwaysFailingModel(),
+                summarizer=summarizer,
+                trigger=("messages", 3),
+                keep=("messages", 1),
+            )
+        ],
+    )
+    inputs = {"messages": [HumanMessage("hi"), AIMessage("hello"), HumanMessage("again")]}
+    if mode == "async":
+        parts = [
+            part async for part in agent.astream(inputs, stream_mode="messages", subgraphs=True)
+        ]
+    else:
+        parts = await asyncio.to_thread(
+            list, agent.stream(inputs, stream_mode="messages", subgraphs=True)
+        )
+
+    root_messages = [message for namespace, (message, _) in parts if not namespace]
+    assert any(
+        "Nested summary." in message.text
+        for message in root_messages
+        if isinstance(message, HumanMessage)
+    )
+    assert not any(
+        namespace and isinstance(message, AIMessageChunk) for namespace, (message, _) in parts
+    )
+    assert (
+        "".join(message.text for message in root_messages if isinstance(message, AIMessage))
+        == "Final answer."
+    )
 
 
 def test_summarizer_replaces_model_call() -> None:
